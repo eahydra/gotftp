@@ -73,7 +73,7 @@ func ReadFile(addr string, filename string, w io.Writer) error {
 	readTimeout := time.Duration(3) * time.Second
 	writeTimeout := readTimeout
 	for {
-		err = processResponse(conn, readTimeout, writeTimeout,
+		err = processResponse(conn, readTimeout, writeTimeout, &raddr,
 			func(resp interface{}) (goon bool, err error) {
 				if dq, ok := resp.(dataReq); ok {
 					if dq.blockID != blockID {
@@ -107,7 +107,7 @@ func ReadFile(addr string, filename string, w io.Writer) error {
 
 		if finalACK {
 			logf("finalACk")
-			processResponse(conn, readTimeout, writeTimeout,
+			processResponse(conn, readTimeout, writeTimeout, &raddr,
 				func(resp interface{}) (goon bool, err error) {
 					if dq, ok := resp.(dataReq); ok {
 						if dq.blockID == blockID {
@@ -154,7 +154,7 @@ func WriteFile(addr string, fileName string, reader io.Reader) error {
 
 	readTimeout := time.Duration(3) * time.Second
 	writeTimeout := readTimeout
-	err = processResponse(conn, readTimeout, writeTimeout,
+	err = processResponse(conn, readTimeout, writeTimeout, &raddr,
 		func(resp interface{}) (goon bool, err error) {
 			if ack, ok := resp.(ackReq); ok {
 				if ack.blockID == 0 {
@@ -190,7 +190,7 @@ func WriteFile(addr string, fileName string, reader io.Reader) error {
 		}
 		logf("send DQ  <blockID=%d %dbytes>", blockID, len(dq.data))
 
-		err = processResponse(conn, readTimeout, writeTimeout,
+		err = processResponse(conn, readTimeout, writeTimeout, &raddr,
 			func(resp interface{}) (goon bool, err error) {
 				if ack, ok := resp.(ackReq); ok {
 					if ack.blockID == blockID {

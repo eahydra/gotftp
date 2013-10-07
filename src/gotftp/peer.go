@@ -182,11 +182,11 @@ func (peer *clientPeer) handleRRQNegotiation(req readFileReq) (err error) {
 		}
 		logf("send OACK")
 
-		return processResponse(peer.conn, peer.readTimeout, peer.writeTimeout,
+		return processResponse(peer.conn, peer.readTimeout, peer.writeTimeout, &peer.addr,
 			func(resp interface{}) (goon bool, err error) {
 				if ack, ok := resp.(ackReq); ok {
 					if ack.blockID == 0 {
-						logln("recv ACK <blockID=0>")
+						logf("recv ACK <blockID=0>")
 						return false, nil
 					}
 				}
@@ -242,7 +242,7 @@ func (peer *clientPeer) handleRRQ(req readFileReq) error {
 		logf("send DQ  <blockID=%d, %dbytes>", blockID, len(dq.data))
 
 		err = processResponse(peer.conn, peer.readTimeout, peer.writeTimeout,
-			func(resp interface{}) (goon bool, err error) {
+			&peer.addr, func(resp interface{}) (goon bool, err error) {
 				if ack, ok := resp.(ackReq); ok {
 					if ack.blockID == blockID {
 						return false, nil
@@ -251,7 +251,7 @@ func (peer *clientPeer) handleRRQ(req readFileReq) error {
 				return true, nil
 			})
 		if err != nil {
-			logln("recv ACK failed. err=%s <blockID=%d>", err.Error(), blockID)
+			logf("recv ACK failed. err=%s <blockID=%d>", err.Error(), blockID)
 			return err
 		}
 		logf("recv ACK <blockID=%d>", blockID)
@@ -325,7 +325,7 @@ func (peer *clientPeer) handleWRQ(req writeFileReq) error {
 	}
 	for transferSize < peer.fileSize {
 		err = processResponse(peer.conn, peer.readTimeout, peer.writeTimeout,
-			func(resp interface{}) (goon bool, err error) {
+			&peer.addr, func(resp interface{}) (goon bool, err error) {
 				if dq, ok := resp.(dataReq); ok {
 					if dq.blockID != blockID {
 						return true, nil
@@ -360,7 +360,7 @@ func (peer *clientPeer) handleWRQ(req writeFileReq) error {
 		if finalACK {
 			logf("finalACK")
 			processResponse(peer.conn, peer.readTimeout, peer.writeTimeout,
-				func(resp interface{}) (goon bool, err error) {
+				&peer.addr, func(resp interface{}) (goon bool, err error) {
 					// if recv dq, means final ack was lost,
 					// so if blockID matched, then resend final ack
 					if dq, ok := resp.(dataReq); ok {

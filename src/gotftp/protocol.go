@@ -378,7 +378,7 @@ func sendErrorReq(conn net.PacketConn, addr net.Addr, err string) {
 	}
 }
 
-func getResponse(conn net.PacketConn, readTimeout, writeTimeout time.Duration) (resp interface{}, err error) {
+func getResponse(conn net.PacketConn, readTimeout, writeTimeout time.Duration) (resp interface{}, raddr net.Addr, err error) {
 	if readTimeout != 0 {
 		conn.SetReadDeadline(time.Now().Add(readTimeout))
 	}
@@ -386,19 +386,21 @@ func getResponse(conn net.PacketConn, readTimeout, writeTimeout time.Duration) (
 		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	}
 	b := make([]byte, 2048)
-	n, _, err := conn.ReadFrom(b)
+	var n int
+	n, raddr, err = conn.ReadFrom(b)
 	if err != nil {
-		return nil, err
+		return nil, raddr, err
 	}
-	return getRequestPacket(b[:n])
+	resp, err = getRequestPacket(b[:n])
+	return
 }
 
 func processResponse(conn net.PacketConn, readTimeout, writeTimeout time.Duration,
-	processor func(resp interface{}) (goon bool, err error)) error {
+	raddr *net.Addr, processor func(resp interface{}) (goon bool, err error)) error {
 	for {
 		var resp interface{}
 		var err error
-		if resp, err = getResponse(conn, readTimeout, writeTimeout); err != nil {
+		if resp, *raddr, err = getResponse(conn, readTimeout, writeTimeout); err != nil {
 			return err
 		}
 		switch t := resp.(type) {
