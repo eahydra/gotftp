@@ -182,7 +182,7 @@ func (peer *clientPeer) handleRRQNegotiation(req readFileReq) (err error) {
 		}
 		logf("send OACK")
 
-		return processResponse(peer.conn, peer.readTimeout, peer.writeTimeout, &peer.addr,
+		return processResponse(peer.conn, peer.readTimeout, peer.writeTimeout, nil,
 			func(resp interface{}) (goon bool, err error) {
 				if ack, ok := resp.(ackReq); ok {
 					if ack.blockID == 0 {
@@ -241,8 +241,8 @@ func (peer *clientPeer) handleRRQ(req readFileReq) error {
 		}
 		logf("send DQ  <blockID=%d, %dbytes>", blockID, len(dq.data))
 
-		err = processResponse(peer.conn, peer.readTimeout, peer.writeTimeout,
-			&peer.addr, func(resp interface{}) (goon bool, err error) {
+		err = processResponse(peer.conn, peer.readTimeout, peer.writeTimeout, nil,
+			func(resp interface{}) (goon bool, err error) {
 				if ack, ok := resp.(ackReq); ok {
 					if ack.blockID == blockID {
 						return false, nil
@@ -324,8 +324,8 @@ func (peer *clientPeer) handleWRQ(req writeFileReq) error {
 		peer.fileSize = maxTransferSize
 	}
 	for transferSize < peer.fileSize {
-		err = processResponse(peer.conn, peer.readTimeout, peer.writeTimeout,
-			&peer.addr, func(resp interface{}) (goon bool, err error) {
+		err = processResponse(peer.conn, peer.readTimeout, peer.writeTimeout, nil,
+			func(resp interface{}) (goon bool, err error) {
 				if dq, ok := resp.(dataReq); ok {
 					if dq.blockID != blockID {
 						return true, nil
@@ -359,8 +359,8 @@ func (peer *clientPeer) handleWRQ(req writeFileReq) error {
 
 		if finalACK {
 			logf("finalACK")
-			processResponse(peer.conn, peer.readTimeout, peer.writeTimeout,
-				&peer.addr, func(resp interface{}) (goon bool, err error) {
+			processResponse(peer.conn, peer.readTimeout, peer.writeTimeout, nil,
+				func(resp interface{}) (goon bool, err error) {
 					// if recv dq, means final ack was lost,
 					// so if blockID matched, then resend final ack
 					if dq, ok := resp.(dataReq); ok {

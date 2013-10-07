@@ -400,8 +400,12 @@ func processResponse(conn net.PacketConn, readTimeout, writeTimeout time.Duratio
 	for {
 		var resp interface{}
 		var err error
-		if resp, *raddr, err = getResponse(conn, readTimeout, writeTimeout); err != nil {
+		var newAddr net.Addr
+		if resp, newAddr, err = getResponse(conn, readTimeout, writeTimeout); err != nil {
 			return err
+		}
+		if raddr != nil {
+			*raddr = newAddr
 		}
 		switch t := resp.(type) {
 		default:
