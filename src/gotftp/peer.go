@@ -76,9 +76,7 @@ func (peer *clientPeer) run(data []byte) {
 
 	req, err := getRequestPacket(data)
 	if err != nil {
-		if err != nil {
-			sendErrorReq(peer.conn, peer.addr, err.Error())
-		}
+		sendErrorReq(peer.conn, peer.addr, err.Error())
 		return
 	}
 	if t, ok := req.(readFileReq); ok {
