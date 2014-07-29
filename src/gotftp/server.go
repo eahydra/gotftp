@@ -76,7 +76,7 @@ func NewServer(handler ServerHandler, readTimeout time.Duration, writeTimeout ti
 
 // Run - TFTP server begin run. Addr is listen ip:port.
 func (s *Server) Run(addr string) error {
-	conn, err := net.ListenPacket("udp", addr)
+	conn, err := net.ListenPacket("udp4", addr)
 	if err != nil {
 		return err
 	}
@@ -98,6 +98,8 @@ func (s *Server) Run(addr string) error {
 
 		if peer, err := newClientPeer(raddr, s.handler, s.readTimeout, s.writeTimeout); err == nil {
 			go peer.run(buff)
+		} else {
+			logln("newClientPeer failed, err:", err)
 		}
 	}
 	panic("gotftp:can't reached!")

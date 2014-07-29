@@ -59,7 +59,7 @@ func ReadFile(addr string, filename string, w io.Writer) error {
 		return err
 	}
 
-	var rrq readFileReq
+	rrq := &rwPacket{opcode: readFileReqOp}
 	rrq.fileName = filename
 	rrq.transferMode = binaryMode
 	if err = sendPacket(conn, raddr, rrq); err != nil {
@@ -75,7 +75,7 @@ func ReadFile(addr string, filename string, w io.Writer) error {
 	for {
 		err = processResponse(conn, readTimeout, writeTimeout, &raddr,
 			func(resp interface{}) (goon bool, err error) {
-				if dq, ok := resp.(dataReq); ok {
+				if dq, ok := resp.(*dataPacket); ok {
 					if dq.blockID != blockID {
 						return true, nil
 					}
@@ -97,7 +97,7 @@ func ReadFile(addr string, filename string, w io.Writer) error {
 			return err
 		}
 
-		var ack ackReq
+		ack := &ackPacket{}
 		ack.blockID = blockID
 		if err = sendPacket(conn, raddr, ack); err != nil {
 			logf("send ACK failed. err=%s <blockID=%d>", err.Error(), blockID)
@@ -109,7 +109,7 @@ func ReadFile(addr string, filename string, w io.Writer) error {
 			logf("finalACk")
 			processResponse(conn, readTimeout, writeTimeout, &raddr,
 				func(resp interface{}) (goon bool, err error) {
-					if dq, ok := resp.(dataReq); ok {
+					if dq, ok := resp.(*dataPacket); ok {
 						if dq.blockID == blockID {
 							sendPacket(conn, raddr, ack)
 						}
@@ -128,7 +128,7 @@ func WriteFile(addr string, fileName string, reader io.Reader) error {
 	logf("begin WRQ <filename=%s mode=octet to=%s>", fileName, addr)
 	defer logf("end WRQ")
 
-	conn, err := net.ListenPacket("udp", ":0")
+	conn, err := net.ListenPacket("udp4", ":0")
 	if err != nil {
 		logf("open connection failed. err=%s", err.Error())
 		return err
@@ -143,7 +143,7 @@ func WriteFile(addr string, fileName string, reader io.Reader) error {
 		return err
 	}
 
-	var wrq writeFileReq
+	wrq := &rwPacket{opcode: writeFileReqOp}
 	wrq.fileName = fileName
 	wrq.transferMode = binaryMode
 	if err = sendPacket(conn, raddr, wrq); err != nil {
@@ -156,7 +156,7 @@ func WriteFile(addr string, fileName string, reader io.Reader) error {
 	writeTimeout := readTimeout
 	err = processResponse(conn, readTimeout, writeTimeout, &raddr,
 		func(resp interface{}) (goon bool, err error) {
-			if ack, ok := resp.(ackReq); ok {
+			if ack, ok := resp.(*ackPacket); ok {
 				if ack.blockID == 0 {
 					return false, nil
 				}
@@ -181,7 +181,7 @@ func WriteFile(addr string, fileName string, reader io.Reader) error {
 			}
 		}
 
-		var dq dataReq
+		dq := &dataPacket{}
 		dq.blockID = blockID
 		dq.data = b[:n]
 		if err = sendPacket(conn, raddr, dq); err != nil {
@@ -192,7 +192,7 @@ func WriteFile(addr string, fileName string, reader io.Reader) error {
 
 		err = processResponse(conn, readTimeout, writeTimeout, &raddr,
 			func(resp interface{}) (goon bool, err error) {
-				if ack, ok := resp.(ackReq); ok {
+				if ack, ok := resp.(*ackPacket); ok {
 					if ack.blockID == blockID {
 						return false, nil
 					}

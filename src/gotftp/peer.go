@@ -34,6 +34,7 @@
 package gotftp
 
 import (
+	"encoding/hex"
 	"errors"
 	"io"
 	"net"
@@ -51,7 +52,8 @@ type clientPeer struct {
 	fileSize     int
 }
 
-func newClientPeer(raddr net.Addr, handler ServerHandler, readTimout, writeTimeout time.Duration) (p *clientPeer, err error) {
+func newClientPeer(raddr net.Addr, handler ServerHandler, readTimout,
+	writeTimeout time.Duration) (p *clientPeer, err error) {
 	conn, err := net.ListenPacket("udp", ":0")
 	if err != nil {
 		return nil, err
@@ -76,13 +78,16 @@ func (peer *clientPeer) run(data []byte) {
 
 	req, err := getRequestPacket(data)
 	if err != nil {
+		logln("getRequestPacket failed, err:", err, "\n", hex.Dump(data))
 		sendErrorReq(peer.conn, peer.addr, err.Error())
 		return
 	}
-	if t, ok := req.(readFileReq); ok {
-		err = peer.handleRRQ(t)
-	} else if t, ok := req.(writeFileReq); ok {
-		err = peer.handleWRQ(t)
+	if p, ok := req.(packet); ok {
+		if p.getOpcode() == readFileReqOp {
+			err = peer.handleRRQ(p)
+		} else if p.getOpcode() == writeFileReqOp {
+			err = peer.handleWRQ(p)
+		}
 	}
 	if err != nil {
 		logln("err:", err.Error())
@@ -90,13 +95,13 @@ func (peer *clientPeer) run(data []byte) {
 	return
 }
 
-func (peer *clientPeer) applyBlockSizeOpt(req beginReq) (opt *oackOpt, err error) {
+func (peer *clientPeer) applyBlockSizeOpt(req *rwPacket) (opt *oackOption, err error) {
 	if req.hasBlockSize {
 		peer.blockSize = defaultBlockSize
 		if req.blockSize < defaultBlockSize {
 			peer.blockSize = req.blockSize
 		}
-		var opt oackOpt
+		var opt oackOption
 		opt.name = blockSizeOptName
 		opt.value = strconv.Itoa(int(peer.blockSize))
 		logf("process blocksize opt <blockSize=%dbyte>", peer.blockSize)
@@ -105,10 +110,10 @@ func (peer *clientPeer) applyBlockSizeOpt(req beginReq) (opt *oackOpt, err error
 	return
 }
 
-func (peer *clientPeer) applyTimeoutOpt(req beginReq) (opt *oackOpt, err error) {
+func (peer *clientPeer) applyTimeoutOpt(req *rwPacket) (opt *oackOption, err error) {
 	if req.hasTimeout {
 		peer.readTimeout, peer.writeTimeout = req.timeout, req.timeout
-		var opt oackOpt
+		var opt oackOption
 		opt.name = timeoutOptName
 		opt.value = strconv.Itoa(int(req.timeout.Seconds()))
 		logf("process timeout opt <timeout=%s>", peer.readTimeout.String())
@@ -117,9 +122,9 @@ func (peer *clientPeer) applyTimeoutOpt(req beginReq) (opt *oackOpt, err error) 
 	return
 }
 
-func (peer *clientPeer) applyTransferSizeOpt(req beginReq) (opt *oackOpt, err error) {
+func (peer *clientPeer) applyTransferSizeOpt(req *rwPacket) (opt *oackOption, err error) {
 	if req.hasTransferSize {
-		var opt oackOpt
+		var opt oackOption
 		opt.name = transferSizeOptName
 		if req.transferSize == 0 {
 			opt.value = strconv.Itoa(peer.fileSize)
@@ -138,14 +143,14 @@ func (peer *clientPeer) applyTransferSizeOpt(req beginReq) (opt *oackOpt, err er
 	return
 }
 
-func (peer *clientPeer) applyOptions(req beginReq) (ackOpts []oackOpt, err error) {
-	applier := []func(req beginReq) (opt *oackOpt, err error){
+func (peer *clientPeer) applyOptions(req *rwPacket) (ackOpts []oackOption, err error) {
+	applier := []func(req *rwPacket) (opt *oackOption, err error){
 		peer.applyBlockSizeOpt,
 		peer.applyTimeoutOpt,
 		peer.applyTransferSizeOpt,
 	}
 	for _, v := range applier {
-		var opt *oackOpt
+		var opt *oackOption
 		if opt, err = v(req); err != nil {
 			return nil, err
 		}
@@ -156,7 +161,7 @@ func (peer *clientPeer) applyOptions(req beginReq) (ackOpts []oackOpt, err error
 	return
 }
 
-func (peer *clientPeer) handleRRQNegotiation(req readFileReq) (err error) {
+func (peer *clientPeer) handleRRQNegotiation(req *rwPacket) (err error) {
 	if req.hasOption {
 		logf("begin RRQ Negotiation")
 		defer func() {
@@ -167,13 +172,13 @@ func (peer *clientPeer) handleRRQNegotiation(req readFileReq) (err error) {
 			}
 		}()
 
-		var opts []oackOpt
-		if opts, err = peer.applyOptions(req.beginReq); err != nil {
+		var opts []oackOption
+		if opts, err = peer.applyOptions(req); err != nil {
 			sendErrorReq(peer.conn, peer.addr, err.Error())
 			return err
 		}
-		var oack oackReq
-		oack.opts = opts
+		oack := &oackPacket{}
+		oack.options = opts
 		if err = sendPacket(peer.conn, peer.addr, oack); err != nil {
 			logf("send OACK failed. err=%s", err.Error())
 			return err
@@ -182,7 +187,7 @@ func (peer *clientPeer) handleRRQNegotiation(req readFileReq) (err error) {
 
 		return processResponse(peer.conn, peer.readTimeout, peer.writeTimeout, nil,
 			func(resp interface{}) (goon bool, err error) {
-				if ack, ok := resp.(ackReq); ok {
+				if ack, ok := resp.(*ackPacket); ok {
 					if ack.blockID == 0 {
 						logf("recv ACK <blockID=0>")
 						return false, nil
@@ -194,7 +199,8 @@ func (peer *clientPeer) handleRRQNegotiation(req readFileReq) (err error) {
 	return nil
 }
 
-func (peer *clientPeer) handleRRQ(req readFileReq) error {
+func (peer *clientPeer) handleRRQ(p packet) error {
+	req := p.(*rwPacket)
 	logf("begin RRQ <fileName=%s, mode=%s, from=%s>", req.fileName, req.transferMode, peer.addr.String())
 	defer logf("end RRQ")
 
@@ -230,7 +236,7 @@ func (peer *clientPeer) handleRRQ(req readFileReq) error {
 			}
 		}
 
-		var dq dataReq
+		dq := &dataPacket{}
 		dq.blockID = blockID
 		dq.data = buff[0:n]
 		if err = sendPacket(peer.conn, peer.addr, dq); err != nil {
@@ -241,7 +247,7 @@ func (peer *clientPeer) handleRRQ(req readFileReq) error {
 
 		err = processResponse(peer.conn, peer.readTimeout, peer.writeTimeout, nil,
 			func(resp interface{}) (goon bool, err error) {
-				if ack, ok := resp.(ackReq); ok {
+				if ack, ok := resp.(*ackPacket); ok {
 					if ack.blockID == blockID {
 						return false, nil
 					}
@@ -263,7 +269,8 @@ func (peer *clientPeer) handleRRQ(req readFileReq) error {
 	return nil
 }
 
-func (peer *clientPeer) handleWRQNegotiation(req writeFileReq) (err error) {
+func (peer *clientPeer) handleWRQNegotiation(p packet) (err error) {
+	req := p.(*rwPacket)
 	if req.hasOption {
 		logf("begin WRQ Negotiation")
 		defer func() {
@@ -274,20 +281,20 @@ func (peer *clientPeer) handleWRQNegotiation(req writeFileReq) (err error) {
 			}
 		}()
 
-		var opts []oackOpt
-		if opts, err = peer.applyOptions(req.beginReq); err != nil {
+		var opts []oackOption
+		if opts, err = peer.applyOptions(req); err != nil {
 			sendErrorReq(peer.conn, peer.addr, err.Error())
 			return err
 		}
-		var oack oackReq
-		oack.opts = opts
+		oack := &oackPacket{}
+		oack.options = opts
 		if err = sendPacket(peer.conn, peer.addr, oack); err != nil {
 			logf("send OACK failed.err=%s", err.Error())
 			return err
 		}
 		logf("send OACK")
 	} else {
-		var ack ackReq
+		ack := &ackPacket{}
 		ack.blockID = 0
 		if err = sendPacket(peer.conn, peer.addr, ack); err != nil {
 			logf("send ACK failed, err=%s, <blockID=0>", err.Error())
@@ -298,7 +305,8 @@ func (peer *clientPeer) handleWRQNegotiation(req writeFileReq) (err error) {
 	return nil
 }
 
-func (peer *clientPeer) handleWRQ(req writeFileReq) error {
+func (peer *clientPeer) handleWRQ(p packet) error {
+	req := p.(*rwPacket)
 	logf("begin WRQ <fileName=%s, mode=%s, from=%s>", req.fileName, req.transferMode, peer.addr.String())
 	defer logf("end WRQ")
 
@@ -324,7 +332,7 @@ func (peer *clientPeer) handleWRQ(req writeFileReq) error {
 	for transferSize < peer.fileSize {
 		err = processResponse(peer.conn, peer.readTimeout, peer.writeTimeout, nil,
 			func(resp interface{}) (goon bool, err error) {
-				if dq, ok := resp.(dataReq); ok {
+				if dq, ok := resp.(*dataPacket); ok {
 					if dq.blockID != blockID {
 						return true, nil
 					}
@@ -347,7 +355,7 @@ func (peer *clientPeer) handleWRQ(req writeFileReq) error {
 			return err
 		}
 
-		var ack ackReq
+		ack := &ackPacket{}
 		ack.blockID = blockID
 		if err = sendPacket(peer.conn, peer.addr, ack); err != nil {
 			logf("send ACK failed. err=%s <blockID=%d>", err.Error(), blockID)
@@ -361,7 +369,7 @@ func (peer *clientPeer) handleWRQ(req writeFileReq) error {
 				func(resp interface{}) (goon bool, err error) {
 					// if recv dq, means final ack was lost,
 					// so if blockID matched, then resend final ack
-					if dq, ok := resp.(dataReq); ok {
+					if dq, ok := resp.(*dataPacket); ok {
 						if dq.blockID == blockID {
 							sendPacket(peer.conn, peer.addr, ack)
 						}

@@ -68,287 +68,343 @@ const (
 )
 
 var (
-	errInvalidReq   = errors.New("invalid request")
-	errBlockSizeOpt = errors.New("invalid blocksize opt")
-	errTimeoutOpt   = errors.New("invalid timeout value opt")
-	errRolloverOpt  = errors.New("invalid rollover opt")
+	errInvalidReq     = errors.New("invalid request")
+	errBlockSizeOpt   = errors.New("invalid blocksize opt")
+	errTimeoutOpt     = errors.New("invalid timeout value opt")
+	errRolloverOpt    = errors.New("invalid rollover opt")
+	errWriteBuffSmall = errors.New("write to buff failed, buffer too small")
+	errUnknownType    = errors.New("unknown type")
 )
 
-type (
-	beginReq struct {
-		fileName        string
-		transferMode    string
-		hasOption       bool
-		hasBlockSize    bool
-		blockSize       uint16
-		hasTransferSize bool
-		transferSize    int
-		hasTimeout      bool
-		timeout         time.Duration
-	}
-	readFileReq struct {
-		beginReq
-	}
-
-	writeFileReq struct {
-		beginReq
-	}
-
-	dataReq struct {
-		blockID uint16
-		data    []byte // max length is 512.
-	}
-
-	ackReq struct {
-		blockID uint16
-	}
-
-	oackOpt struct {
-		name  string
-		value string
-	}
-
-	oackReq struct {
-		opts []oackOpt
-	}
-
-	errorReq struct {
-		code uint16
-		msg  string
-	}
-)
-
-type optionHandler struct {
-	name    string
-	handler func(value string, req *beginReq) error
+type packet interface {
+	getOpcode() uint16
+	Read(buff *bytes.Buffer) error
+	Write(buff *bytes.Buffer) error
 }
 
-var optHandlers = []optionHandler{
-	{
-		name: blockSizeOptName,
-		handler: func(value string, req *beginReq) error {
-			var size int
-			var err error
-			if size, err = strconv.Atoi(value); err != nil {
-				return err
-			}
-			if size < int(minBlockSize) {
-				return errBlockSizeOpt
-			}
-			if size > int(maxBlockSize) {
-				size = int(maxBlockSize)
-			}
-			req.blockSize = uint16(size)
-			req.hasBlockSize = true
-			return nil
-		},
-	},
-	{
-		name: timeoutOptName,
-		handler: func(value string, req *beginReq) error {
-			var v int
-			var err error
-			if v, err = strconv.Atoi(value); err != nil {
-				return err
-			}
-			if uint16(v) < minTimeout || uint16(v) > maxTimeout {
-				return errTimeoutOpt
-			}
-			req.timeout = time.Duration(v) * time.Second
-			req.hasTimeout = true
-			return nil
-		},
-	},
-	{
-		name: transferSizeOptName,
-		handler: func(value string, req *beginReq) error {
-			var size int
-			var err error
-			if size, err = strconv.Atoi(value); err != nil {
-				return err
-			}
-			req.transferSize = size
-			req.hasTransferSize = true
-			return nil
-		},
-	},
+type rwPacket struct {
+	opcode          uint16
+	fileName        string
+	transferMode    string
+	hasOption       bool
+	hasBlockSize    bool
+	blockSize       uint16
+	hasTransferSize bool
+	transferSize    int
+	hasTimeout      bool
+	timeout         time.Duration
 }
 
-func getOption(buff []byte) (req beginReq, err error) {
-	values := bytes.Split(buff, []byte{0})
-	if len(values)-1 < 2 {
-		err = errInvalidReq
-		return
+func (p *rwPacket) getOpcode() uint16 {
+	return p.opcode
+}
+
+func (p *rwPacket) Read(buff *bytes.Buffer) error {
+	var err error
+	if p.fileName, err = buff.ReadString(0); err != nil {
+		return err
 	}
-	req.fileName = string(bytes.ToLower(values[0]))
-	req.transferMode = string(bytes.ToLower(values[1]))
-	if len(values)-1 == 2 {
-		return
+	p.fileName = p.fileName[:len(p.fileName)-1]
+	if p.transferMode, err = buff.ReadString(0); err != nil {
+		return err
 	}
-	// there are some option such as blksize, timeout or another thing.
-	if (len(values[2:])-1)%2 != 0 {
-		err = errInvalidReq
-		return
-	}
-	values = values[2:]
-	for i := 0; i < len(values); {
-		s := string(bytes.ToLower(values[i]))
-		value := string(values[i+1])
-		for _, v := range optHandlers {
-			if v.name == s {
-				if err = v.handler(value, &req); err != nil {
-					return
+	p.transferMode = p.transferMode[:len(p.transferMode)-1]
+
+	if buff.Len() != 0 {
+		for buff.Len() > 0 {
+			var optionName string
+			if optionName, err = buff.ReadString(0); err != nil {
+				return err
+			}
+			optionName = optionName[:len(optionName)-1]
+			var value string
+			if value, err = buff.ReadString(0); err != nil {
+				return err
+			}
+			value = value[:len(value)-1]
+			switch optionName {
+			case blockSizeOptName:
+				{
+					var size int
+					if size, err = strconv.Atoi(value); err != nil {
+						return err
+					}
+					if size < int(minBlockSize) {
+						return errBlockSizeOpt
+					}
+					if size > int(maxBlockSize) {
+						size = int(maxBlockSize)
+					}
+					p.blockSize = uint16(size)
+					p.hasBlockSize = true
 				}
+			case timeoutOptName:
+				{
+					var timeout int
+					if timeout, err = strconv.Atoi(value); err != nil {
+						return err
+					}
+					if uint16(timeout) < minTimeout || uint16(timeout) > maxTimeout {
+						return errTimeoutOpt
+					}
+					p.timeout = time.Duration(timeout) * time.Second
+					p.hasTimeout = true
+				}
+			case transferSizeOptName:
+				{
+					var size int
+					if size, err = strconv.Atoi(value); err != nil {
+						return err
+					}
+					p.transferSize = size
+					p.hasTransferSize = true
+				}
+			default:
 			}
+
 		}
-		i += 2
 	}
-	return
+	return nil
 }
 
-func getRequestPacket(buff []byte) (packet interface{}, err error) {
-	if len(buff) < 2 {
+func (p *rwPacket) Write(buff *bytes.Buffer) error {
+	if err := binary.Write(buff, binary.BigEndian, p.opcode); err != nil {
+		return err
+	}
+	if _, err := buff.WriteString(p.fileName); err != nil {
+		return err
+	}
+	if err := buff.WriteByte(0); err != nil {
+		return err
+	}
+	if n, err := buff.WriteString(p.transferMode); err != nil {
+		return err
+	} else if n < len(p.transferMode) {
+		return errWriteBuffSmall
+	}
+	return buff.WriteByte(0)
+}
+
+type dataPacket struct {
+	blockID uint16
+	data    []byte // max length is 512.
+}
+
+func (p *dataPacket) getOpcode() uint16 {
+	return dataReqOp
+}
+
+func (p *dataPacket) Read(buff *bytes.Buffer) error {
+	if err := binary.Read(buff, binary.BigEndian, &p.blockID); err != nil {
+		return err
+	}
+	p.data = make([]byte, buff.Len())
+	if _, err := buff.Read(p.data); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (p *dataPacket) Write(buff *bytes.Buffer) error {
+	if err := binary.Write(buff, binary.BigEndian, dataReqOp); err != nil {
+		return err
+	}
+	if err := binary.Write(buff, binary.BigEndian, p.blockID); err != nil {
+		return err
+	}
+	if n, err := buff.Write(p.data); err != nil {
+		return err
+	} else if n < len(p.data) {
+		return errWriteBuffSmall
+	}
+	return nil
+}
+
+type ackPacket struct {
+	blockID uint16
+}
+
+func (p *ackPacket) getOpcode() uint16 {
+	return ackReqOp
+}
+
+func (p *ackPacket) Read(buff *bytes.Buffer) error {
+	return binary.Read(buff, binary.BigEndian, &p.blockID)
+}
+
+func (p *ackPacket) Write(buff *bytes.Buffer) error {
+	if err := binary.Write(buff, binary.BigEndian, ackReqOp); err != nil {
+		return err
+	}
+	return binary.Write(buff, binary.BigEndian, p.blockID)
+}
+
+type oackOption struct {
+	name  string
+	value string
+}
+
+type oackPacket struct {
+	options []oackOption
+}
+
+func (p *oackPacket) getOpcode() uint16 {
+	return oackReqOp
+}
+
+func (p *oackPacket) Read(buff *bytes.Buffer) error {
+	for buff.Len() > 0 {
+		var err error
+		var opt oackOption
+		if opt.name, err = buff.ReadString(0); err != nil {
+			return err
+		}
+		opt.name = opt.name[:len(opt.name)-1]
+		if opt.value, err = buff.ReadString(0); err != nil {
+			return err
+		}
+		opt.value = opt.value[:len(opt.value)-1]
+		p.options = append(p.options, opt)
+	}
+	return nil
+}
+
+func (p *oackPacket) Write(buff *bytes.Buffer) error {
+	if err := binary.Write(buff, binary.BigEndian, oackReqOp); err != nil {
+		return err
+	}
+	for _, v := range p.options {
+		if n, err := buff.WriteString(v.name); err != nil {
+			return err
+		} else if n < len(v.name) {
+			return errWriteBuffSmall
+		}
+		if err := buff.WriteByte(0); err != nil {
+			return err
+		}
+		if n, err := buff.WriteString(v.value); err != nil {
+			return err
+		} else if n < len(v.value) {
+			return errWriteBuffSmall
+		}
+		if err := buff.WriteByte(0); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type errorPacket struct {
+	code uint32
+	msg  string
+}
+
+func (p *errorPacket) getOpcode() uint16 {
+	return errorReqOp
+}
+
+func (p *errorPacket) Read(buff *bytes.Buffer) error {
+	var err error
+	if err = binary.Read(buff, binary.BigEndian, &p.code); err != nil {
+		return err
+	}
+	if p.msg, err = buff.ReadString(0); err != nil {
+		return err
+	}
+	p.msg = p.msg[:len(p.msg)-1]
+	return nil
+}
+
+func (p *errorPacket) Write(buff *bytes.Buffer) error {
+	if err := binary.Write(buff, binary.BigEndian, errorReqOp); err != nil {
+		return err
+	}
+	if err := binary.Write(buff, binary.BigEndian, p.code); err != nil {
+		return err
+	}
+	if n, err := buff.WriteString(p.msg); err != nil {
+		return err
+	} else if n < len(p.msg) {
+		return errWriteBuffSmall
+	}
+	return buff.WriteByte(0)
+}
+
+func getRequestPacket(data []byte) (packet interface{}, err error) {
+	if len(data) < 2 {
 		return nil, errInvalidReq
 	}
-	opcode := binary.BigEndian.Uint16(buff[0:2])
+	buff := bytes.NewBuffer(data)
+	var opcode uint16
+	if err = binary.Read(buff, binary.BigEndian, &opcode); err != nil {
+		return nil, err
+	}
 	switch opcode {
 	case readFileReqOp:
 		{
-			var rrq readFileReq
-			rrq.beginReq, err = getOption(buff[2:])
-			if err != nil || len(rrq.fileName) == 0 || len(rrq.transferMode) == 0 ||
-				(rrq.transferMode != netASCIIMode && rrq.transferMode != binaryMode) {
-				return nil, errInvalidReq
+			p := &rwPacket{opcode: readFileReqOp}
+			if err = p.Read(buff); err != nil {
+				return nil, err
 			}
-			return rrq, nil
+			if len(p.fileName) == 0 || len(p.transferMode) == 0 ||
+				(p.transferMode != netASCIIMode && p.transferMode != binaryMode) {
+				return nil, err
+			}
+			return p, nil
 		}
 	case writeFileReqOp:
 		{
-			var wrq writeFileReq
-			wrq.beginReq, err = getOption(buff[2:])
-			if len(wrq.fileName) == 0 || len(wrq.transferMode) == 0 ||
-				(wrq.transferMode != netASCIIMode && wrq.transferMode != binaryMode) {
+			p := &rwPacket{opcode: writeFileReqOp}
+			if err = p.Read(buff); err != nil {
+				return nil, err
+			}
+
+			if len(p.fileName) == 0 || len(p.transferMode) == 0 ||
+				(p.transferMode != netASCIIMode && p.transferMode != binaryMode) {
 				return nil, errInvalidReq
 			}
-			return wrq, nil
+			return p, nil
 		}
 	case dataReqOp:
 		{
-			if len(buff[2:]) < 2 {
-				return nil, errInvalidReq
+			p := &dataPacket{}
+			if err = p.Read(buff); err != nil {
+				return nil, err
 			}
-			var dq dataReq
-			dq.blockID = binary.BigEndian.Uint16(buff[2:])
-			dq.data = make([]byte, len(buff[4:]))
-			copy(dq.data, buff[4:])
-			return dq, nil
+			return p, nil
 		}
 	case ackReqOp:
 		{
-			if len(buff[2:]) < 2 {
-				return nil, errInvalidReq
+			p := &ackPacket{}
+			if err = p.Read(buff); err != nil {
+				return nil, err
 			}
-			var ackReq ackReq
-			ackReq.blockID = binary.BigEndian.Uint16(buff[2:])
-			return ackReq, nil
+			return p, nil
 		}
 	case oackReqOp:
 		{
-			opts := bytes.Split(buff[2:], []byte{0})
-			if (len(opts)-1)%2 != 0 {
-				return nil, errInvalidReq
+			p := &oackPacket{}
+			if err = p.Read(buff); err != nil {
+				return nil, err
 			}
-			var oack oackReq
-			for i := 0; i < len(opts); {
-				var opt oackOpt
-				opt.name = string(bytes.ToLower(opts[i]))
-				opt.value = string(opts[i+1])
-				oack.opts = append(oack.opts, opt)
-			}
-			return oack, nil
+			return p, nil
 		}
 	case errorReqOp:
 		{
-			if len(buff[2:]) < 2 {
-				return nil, errInvalidReq
+			p := &errorPacket{}
+			if err = p.Read(buff); err != nil {
+				return nil, err
 			}
-			var err errorReq
-			err.code = binary.BigEndian.Uint16(buff[2:])
-			var eof bool
-			var msg []byte
-			for _, v := range buff[4:] {
-				if v != 0 {
-					msg = append(msg, v)
-				} else {
-					eof = true
-					break
-				}
-			}
-			if !eof {
-				return nil, errInvalidReq
-			}
-			return err, nil
+			return p, nil
 		}
 	}
 	return nil, errInvalidReq
 }
 
 func packetReq(req interface{}) []byte {
-	switch t := req.(type) {
-	case readFileReq:
-		{
-			buff := new(bytes.Buffer)
-			binary.Write(buff, binary.BigEndian, readFileReqOp)
-			buff.WriteString(t.fileName)
-			buff.WriteByte(0)
-			buff.WriteString(t.transferMode)
-			buff.WriteByte(0)
-			return buff.Bytes()
-		}
-	case writeFileReq:
-		{
-			buff := new(bytes.Buffer)
-			binary.Write(buff, binary.BigEndian, writeFileReqOp)
-			buff.WriteString(t.fileName)
-			buff.WriteByte(0)
-			buff.WriteString(t.transferMode)
-			buff.WriteByte(0)
-			return buff.Bytes()
-		}
-	case dataReq:
-		{
-			buff := new(bytes.Buffer)
-			binary.Write(buff, binary.BigEndian, dataReqOp)
-			binary.Write(buff, binary.BigEndian, t.blockID)
-			buff.Write(t.data)
-			return buff.Bytes()
-		}
-	case ackReq:
-		{
-			buff := new(bytes.Buffer)
-			binary.Write(buff, binary.BigEndian, ackReqOp)
-			binary.Write(buff, binary.BigEndian, t.blockID)
-			return buff.Bytes()
-		}
-	case oackReq:
-		{
-			buff := new(bytes.Buffer)
-			binary.Write(buff, binary.BigEndian, oackReqOp)
-			for _, v := range t.opts {
-				buff.WriteString(v.name)
-				buff.WriteByte(0)
-				buff.WriteString(v.value)
-				buff.WriteByte(0)
-			}
-			return buff.Bytes()
-		}
-	case errorReq:
-		{
-			buff := new(bytes.Buffer)
-			binary.Write(buff, binary.BigEndian, errorReqOp)
-			binary.Write(buff, binary.BigEndian, t.code)
-			buff.WriteString(t.msg)
-			buff.WriteByte(0)
+	if packet, ok := req.(packet); ok {
+		buff := bytes.NewBuffer(nil)
+		if err := packet.Write(buff); err == nil {
 			return buff.Bytes()
 		}
 	}
@@ -369,7 +425,7 @@ func sendPacket(conn net.PacketConn, addr net.Addr, p interface{}) error {
 }
 
 func sendErrorReq(conn net.PacketConn, addr net.Addr, err string) {
-	var eq errorReq
+	var eq errorPacket
 	eq.code = 0
 	eq.msg = err
 	b := packetReq(eq)
@@ -417,7 +473,7 @@ func processResponse(conn net.PacketConn, readTimeout, writeTimeout time.Duratio
 					return nil
 				}
 			}
-		case errorReq:
+		case *errorPacket:
 			{
 				return errors.New(t.msg)
 			}
