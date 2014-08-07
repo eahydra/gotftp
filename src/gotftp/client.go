@@ -1,214 +1,154 @@
-/*
- * Copyright (c) 2013 author: LiTao
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
- */
-
 package gotftp
 
 import (
+	"bytes"
+	"encoding/binary"
 	"io"
 	"net"
 	"time"
 )
 
-// ReadFile - read filename from addr to w. The MAX size is 32MB
-func ReadFile(addr string, filename string, w io.Writer) error {
-	logf("begin RRQ <fileName=%s mode=octet to=%s>", filename, addr)
-	defer logf("end RRQ")
+type Client struct {
+	remoteAddr net.Addr
+	conn       net.PacketConn
+	timeout    time.Duration
+	retryTime  int
+}
 
-	conn, err := net.ListenPacket("udp", ":0")
-	if err != nil {
-		logf("open connection failed. err=%s", err.Error())
-		return err
-	}
-	defer conn.Close()
-	logf("open connection success")
-
+func NewClient(addr string, timeout time.Duration, retryTime int) (*Client, error) {
 	var raddr net.Addr
-	raddr, err = net.ResolveUDPAddr("udp", addr)
+	raddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
-		logf("resolve address failed. err=%s", err.Error())
+		return nil, err
+	}
+	conn, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		return nil, err
+	}
+	return &Client{
+		conn:       conn,
+		remoteAddr: raddr,
+		timeout:    timeout,
+		retryTime:  retryTime,
+	}, nil
+}
+
+func (c *Client) Close() error {
+	return c.conn.Close()
+}
+
+func (c *Client) Get(fileName string, writer io.WriterAt) error {
+	rrq := bytes.NewBuffer(nil)
+	binary.Write(rrq, binary.BigEndian, uint16(0x01))
+	rrq.WriteString(fileName)
+	rrq.WriteByte(0)
+	rrq.WriteString("octet")
+	rrq.WriteByte(0)
+	if _, err := c.conn.WriteTo(rrq.Bytes(), c.remoteAddr); err != nil {
 		return err
 	}
 
-	rrq := &rwPacket{opcode: readFileReqOp}
-	rrq.fileName = filename
-	rrq.transferMode = binaryMode
-	if err = sendPacket(conn, raddr, rrq); err != nil {
-		logf("send RRQ failed. err=%s", err.Error())
-		return err
-	}
-	logf("send RRQ <filename=%s, mode=octet>", filename)
-
-	var blockID uint16 = 1
-	var finalACK bool
-	readTimeout := time.Duration(3) * time.Second
-	writeTimeout := readTimeout
+	data := make([]byte, 1024)
+	retryTime := 0
+readLoop:
 	for {
-		err = processResponse(conn, readTimeout, writeTimeout, &raddr,
-			func(resp interface{}) (goon bool, err error) {
-				if dq, ok := resp.(*dataPacket); ok {
-					if dq.blockID != blockID {
-						return true, nil
-					}
-					logf("recv DQ  <blockID=%d %dbytes>", blockID, len(dq.data))
-					if _, err = w.Write(dq.data); err != nil {
-						logf("wrtie failed. err=%s", err.Error())
-						sendErrorReq(conn, raddr, err.Error())
-						return false, err
-					}
-					if len(dq.data) != int(defaultBlockSize) {
-						finalACK = true
-					}
-					return false, nil
-
-				}
-				return true, nil
-			})
+		c.conn.SetReadDeadline(time.Now().Add(c.timeout))
+		n, remoteAddr, err := c.conn.ReadFrom(data)
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() && retryTime < c.retryTime {
+				retryTime++
+				continue
+			}
 			return err
 		}
-
-		ack := &ackPacket{}
-		ack.blockID = blockID
-		if err = sendPacket(conn, raddr, ack); err != nil {
-			logf("send ACK failed. err=%s <blockID=%d>", err.Error(), blockID)
-			return err
+		retryTime = 0
+		buff := bytes.NewBuffer(data[:n])
+		var operation uint16
+		if err = binary.Read(buff, binary.BigEndian, &operation); err != nil {
+			continue
 		}
-		logf("send ACK <blockID=%d>", blockID)
-
-		if finalACK {
-			logf("finalACk")
-			processResponse(conn, readTimeout, writeTimeout, &raddr,
-				func(resp interface{}) (goon bool, err error) {
-					if dq, ok := resp.(*dataPacket); ok {
-						if dq.blockID == blockID {
-							sendPacket(conn, raddr, ack)
-						}
-					}
-					return false, nil
-				})
-			break
+		switch operation {
+		case 3: // data packet
+			{
+				var blockID uint16
+				if err := binary.Read(buff, binary.BigEndian, &blockID); err != nil {
+					continue readLoop
+				}
+				content := buff.Next(buff.Len())
+				if _, err := writer.WriteAt(content, int64(blockID-1)*512); err == nil {
+					ackpacket := []byte{0x00, 0x04, 0x00, 0x00}
+					binary.BigEndian.PutUint16(ackpacket[2:], blockID)
+					c.conn.WriteTo(ackpacket, remoteAddr)
+				}
+				if len(content) < 512 {
+					break readLoop
+				}
+			}
+		case 5: // error packet
+			{
+				return handleError(buff)
+			}
 		}
-		blockID++
 	}
 	return nil
 }
 
-// WriteFile - Write fileName from reader to addr. The max size is 32MB
-func WriteFile(addr string, fileName string, reader io.Reader) error {
-	logf("begin WRQ <filename=%s mode=octet to=%s>", fileName, addr)
-	defer logf("end WRQ")
-
-	conn, err := net.ListenPacket("udp4", ":0")
-	if err != nil {
-		logf("open connection failed. err=%s", err.Error())
+func (c *Client) Put(fileName string, reader io.ReaderAt) error {
+	wrq := bytes.NewBuffer(nil)
+	binary.Write(wrq, binary.BigEndian, uint16(0x02))
+	wrq.WriteString(fileName)
+	wrq.WriteByte(0)
+	wrq.WriteString("octet")
+	wrq.WriteByte(0)
+	if _, err := c.conn.WriteTo(wrq.Bytes(), c.remoteAddr); err != nil {
 		return err
 	}
-	defer conn.Close()
-	logf("open connection success")
-
-	var raddr net.Addr
-	raddr, err = net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		logf("resolve address failed. err=%s", err.Error())
-		return err
-	}
-
-	wrq := &rwPacket{opcode: writeFileReqOp}
-	wrq.fileName = fileName
-	wrq.transferMode = binaryMode
-	if err = sendPacket(conn, raddr, wrq); err != nil {
-		logf("send WRQ failed. err=%s <filename=%s mode=octet>", err.Error(), fileName)
-		return err
-	}
-	logf("send WRQ <filename=%s> mode=octet", fileName)
-
-	readTimeout := time.Duration(3) * time.Second
-	writeTimeout := readTimeout
-	err = processResponse(conn, readTimeout, writeTimeout, &raddr,
-		func(resp interface{}) (goon bool, err error) {
-			if ack, ok := resp.(*ackPacket); ok {
-				if ack.blockID == 0 {
-					return false, nil
-				}
-			}
-			return true, nil
-		})
-	if err != nil {
-		logf("recv ACK failed. err=%s <blockID=0>", err.Error())
-		return err
-	}
-	logf("recv ACK <blockID=0>")
-
-	var blockID uint16 = 1
+	data := make([]byte, 1024)
+	retryTime := 0
+writeLoop:
 	for {
-		b := make([]byte, defaultBlockSize)
-		var n int
-		if n, err = reader.Read(b); err != nil {
-			if err != io.EOF {
-				logf("read failed. err=%s", err.Error())
-				sendErrorReq(conn, raddr, err.Error())
-				return err
+		c.conn.SetReadDeadline(time.Now().Add(c.timeout))
+		n, remoteAddr, err := c.conn.ReadFrom(data)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() && retryTime < c.retryTime {
+				retryTime++
+				continue
+			}
+			return err
+		}
+		retryTime = 0
+		buff := bytes.NewBuffer(data[:n])
+		var operation uint16
+		if err = binary.Read(buff, binary.BigEndian, &operation); err != nil {
+			continue
+		}
+		switch operation {
+		case 4: // ack packet
+			{
+				var blockID uint16
+				if err := binary.Read(buff, binary.BigEndian, &blockID); err != nil {
+					continue writeLoop
+				}
+				binary.BigEndian.PutUint16(data[0:2], uint16(0x03))
+				binary.BigEndian.PutUint16(data[2:], blockID+1)
+				n, err := reader.ReadAt(data[4:516], int64(blockID)*512)
+				if err != nil {
+					if err == io.EOF {
+						err = nil
+						break writeLoop
+					}
+					sendError(c.conn, remoteAddr, err)
+					return err
+				}
+				if _, err := c.conn.WriteTo(data[:n+4], remoteAddr); err != nil {
+					return err
+				}
+			}
+		case 5: // error packet
+			{
+				return handleError(buff)
 			}
 		}
-
-		dq := &dataPacket{}
-		dq.blockID = blockID
-		dq.data = b[:n]
-		if err = sendPacket(conn, raddr, dq); err != nil {
-			logf("send DQ failed. err=%s, <blockID=%d %dbytes>", err.Error(), blockID, len(dq.data))
-			return err
-		}
-		logf("send DQ  <blockID=%d %dbytes>", blockID, len(dq.data))
-
-		err = processResponse(conn, readTimeout, writeTimeout, &raddr,
-			func(resp interface{}) (goon bool, err error) {
-				if ack, ok := resp.(*ackPacket); ok {
-					if ack.blockID == blockID {
-						return false, nil
-					}
-				}
-				return true, nil
-			})
-		if err != nil {
-			logf("recv ACK failed. err=%s, <blockID=%d>", err.Error(), blockID)
-			return err
-		}
-		logf("recv ACK <blockID=%d>", blockID)
-
-		if n < int(defaultBlockSize) {
-			break
-		}
-		blockID++
 	}
 	return nil
 }

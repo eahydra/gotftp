@@ -1,106 +1,150 @@
-/*
- * Copyright (c) 2013 author: LiTao
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
- */
-
 package gotftp
 
 import (
 	"io"
 	"net"
+	"sync"
 	"time"
 )
 
-// ReadCloser - contains io.ReadCloser. Used to read data and close.
-type ReadCloser interface {
-	io.ReadCloser
-	Size() (n int64, err error)
+type ReadSeekCloser interface {
+	io.Reader
+	io.Seeker
+	io.Closer
 }
 
-// WriteCloser - contains io.WriteCloser. Used to write data and close when finish.
-type WriteCloser interface {
-	io.WriteCloser
+type WriteSeekCloser interface {
+	io.Writer
+	io.Seeker
+	io.Closer
 }
 
-// ServerHandler - handle TFTP request.
-type ServerHandler interface {
-	// ReadFile - process RRQ. The param file is target file path
-	ReadFile(file string) (f ReadCloser, err error)
-	// WrieFile - process WRQ. The param file is targe file path
-	WriteFile(file string) (f WriteCloser, err error)
+type FileHandler interface {
+	ReadFile(remoteAddr, fileName string) (ReadSeekCloser, error)
+	WriteFile(remoteAddr, fileName string) (WriteSeekCloser, error)
+	IsFileExist(remoteAddr, fileName string) (exist bool, err error)
 }
 
-// Server - TFTP Server struct.
+type clientPacket struct {
+	data       []byte
+	remoteAddr net.Addr
+}
+
 type Server struct {
-	handler      ServerHandler
-	readTimeout  time.Duration
-	writeTimeout time.Duration
+	closed      bool
+	conn        net.PacketConn
+	fileHandler FileHandler
+	readTimeout time.Duration
+	packetChan  chan clientPacket
+	done        chan struct{}
+	peerMap     map[string]*clientPeer
+	lock        sync.Mutex
+	pool        *sync.Pool
 }
 
-// NewServer - Create a new TFTP Server instance.
-func NewServer(handler ServerHandler, readTimeout time.Duration, writeTimeout time.Duration) *Server {
-	return &Server{
-		handler:      handler,
-		readTimeout:  readTimeout,
-		writeTimeout: writeTimeout,
-	}
+func allocateBuffer() interface{} {
+	return make([]byte, 1024)
 }
 
-// Run - TFTP server begin run. Addr is listen ip:port.
-func (s *Server) Run(addr string) error {
+func NewServer(addr string, fileHandler FileHandler, readTimeout time.Duration) (*Server, error) {
 	conn, err := net.ListenPacket("udp4", addr)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	return &Server{
+		conn:        conn,
+		fileHandler: fileHandler,
+		readTimeout: readTimeout,
+		done:        make(chan struct{}, 1),
+		packetChan:  make(chan clientPacket, 1024),
+		peerMap:     make(map[string]*clientPeer),
+		pool:        &sync.Pool{New: allocateBuffer},
+	}, nil
+}
+
+func (s *Server) Close() error {
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	close(s.done)
+	return s.conn.Close()
+}
+
+func (s *Server) removeClientPeer() {
+	for {
+		select {
+		case <-time.After(time.Duration(100) * time.Millisecond):
+			{
+				now := time.Now()
+				s.lock.Lock()
+				for k, v := range s.peerMap {
+					if now.Sub(v.keepaliveTime) > time.Duration(v.timeout)*time.Second {
+						logln("timeout, remote:", v.remoteAddr.String())
+						v.Close()
+						delete(s.peerMap, k)
+					}
+				}
+				s.lock.Unlock()
+			}
+		case <-s.done:
+			{
+				return
+			}
+		}
+	}
+}
+
+func (s *Server) work() {
+	for {
+		select {
+		case r, ok := <-s.packetChan:
+			{
+				if ok {
+					var p *clientPeer
+					s.lock.Lock()
+					if p, ok = s.peerMap[r.remoteAddr.String()]; !ok {
+						p = newClientPeer(r.remoteAddr, s.fileHandler)
+						s.peerMap[r.remoteAddr.String()] = p
+					}
+					s.lock.Unlock()
+					p.Dispatch(s.conn, r.data)
+					s.pool.Put(r.data[:cap(r.data)])
+				}
+			}
+		case <-s.done:
+			{
+				return
+			}
+		}
+	}
+}
+
+func (s *Server) Run() error {
+	go s.removeClientPeer()
+	go s.work()
 	for {
 		if s.readTimeout != 0 {
-			conn.SetReadDeadline(time.Now().Add(s.readTimeout))
+			s.conn.SetReadDeadline(time.Now().Add(s.readTimeout))
 		}
 
-		if s.writeTimeout != 0 {
-			conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
+		buff := s.pool.Get().([]byte)
+		n, raddr, err := s.conn.ReadFrom(buff)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok {
+				if netErr.Timeout() {
+					s.pool.Put(buff)
+					continue
+				}
+			}
+			return err
 		}
 
-		buff := make([]byte, 1024)
-		n, raddr, err := conn.ReadFrom(buff)
-		if err != nil || n == 0 {
-			continue
-		}
-		buff = buff[:n]
-
-		if peer, err := newClientPeer(raddr, s.handler, s.readTimeout, s.writeTimeout); err == nil {
-			go peer.run(buff)
-		} else {
-			logln("newClientPeer failed, err:", err)
+		select {
+		case <-s.done:
+			return nil
+		case s.packetChan <- clientPacket{buff[:n], raddr}:
 		}
 	}
-	panic("gotftp:can't reached!")
+	return nil
 }

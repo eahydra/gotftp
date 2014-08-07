@@ -1,384 +1,460 @@
-/*
- * Copyright (c) 2013 author: LiTao
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
- */
-
 package gotftp
 
 import (
-	"encoding/hex"
-	"errors"
+	"bytes"
+	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 )
 
-type clientPeer struct {
-	conn         net.PacketConn
-	addr         net.Addr
-	handler      ServerHandler
-	readTimeout  time.Duration
-	writeTimeout time.Duration
-	blockSize    uint16
-	fileSize     int
-}
+var (
+	errNotDefinedPacket       = []byte{0x00, 0x05, 0x00, 0x00}
+	errFileNotFoundPacket     = []byte{0x00, 0x05, 0x00, 0x01, 0x00}
+	errIllegalOperationPacket = []byte{0x00, 0x05, 0x00, 0x04, 0x00}
+	errFileExistPacket        = []byte{0x00, 0x05, 0x00, 0x06, 0x00}
+)
 
-func newClientPeer(raddr net.Addr, handler ServerHandler, readTimout,
-	writeTimeout time.Duration) (p *clientPeer, err error) {
-	conn, err := net.ListenPacket("udp", ":0")
-	if err != nil {
-		return nil, err
+func handleError(buff *bytes.Buffer) error {
+	var code uint16
+	var err error
+	if err = binary.Read(buff, binary.BigEndian, &code); err == nil {
+		var msg string
+		msg, err = buff.ReadString(0)
+		if err != nil {
+			switch code {
+			case 1:
+				msg = "file not found"
+			case 2:
+				msg = "access violation"
+			case 3:
+				msg = "disk full or allocation exceeded"
+			case 4:
+				msg = "illegal tftp operation"
+			case 5:
+				msg = "unknown transfer id"
+			case 6:
+				msg = "file already exists"
+			case 7:
+				msg = "no such user"
+			default:
+				msg = "not define"
+			}
+		}
+		err = fmt.Errorf("code:%d, msg:%s", code, msg)
 	}
-	p = new(clientPeer)
-	p.conn = conn
-	p.addr = raddr
-	p.handler = handler
-	p.readTimeout = readTimout
-	p.writeTimeout = writeTimeout
-	p.blockSize = defaultBlockSize
-	p.fileSize = 0
-	return
+	return err
 }
 
-func (peer *clientPeer) close() {
-	peer.conn.Close()
+func sendError(conn net.PacketConn, remoteAddr net.Addr, err error) {
+	logln("err:", err)
+	errPacket := bytes.NewBuffer(nil)
+	errPacket.Write(errNotDefinedPacket)
+	errPacket.WriteString(err.Error())
+	errPacket.WriteByte(0)
+	conn.WriteTo(errPacket.Bytes(), remoteAddr)
 }
 
-func (peer *clientPeer) run(data []byte) {
-	defer peer.close()
+func sendOptionAck(conn net.PacketConn, remoteAddr net.Addr, blkSize, timeout, tsize int) {
+	oack := bytes.NewBuffer([]byte{0x00, 0x06})
+	oack.WriteString("blksize")
+	oack.WriteByte(0)
+	oack.WriteString(fmt.Sprintf("%d", blkSize))
+	oack.WriteByte(0)
+	oack.WriteString("timeout")
+	oack.WriteByte(0)
+	oack.WriteString(fmt.Sprintf("%d", timeout))
+	oack.WriteByte(0)
+	oack.WriteString("tsize")
+	oack.WriteByte(0)
+	oack.WriteString(fmt.Sprintf("%d", tsize))
+	oack.WriteByte(0)
+	conn.WriteTo(oack.Bytes(), remoteAddr)
+}
 
-	req, err := getRequestPacket(data)
-	if err != nil {
-		logln("getRequestPacket failed, err:", err, "\n", hex.Dump(data))
-		sendErrorReq(peer.conn, peer.addr, err.Error())
+type clientPeer struct {
+	remoteAddr      net.Addr
+	keepaliveTime   time.Time
+	blockSize       int
+	transferSize    int
+	timeout         int
+	fileHandler     FileHandler
+	readSeekCloser  ReadSeekCloser
+	writeSeekCloser WriteSeekCloser
+}
+
+func newClientPeer(remoteAddr net.Addr, fileHandler FileHandler) *clientPeer {
+	return &clientPeer{
+		remoteAddr:    remoteAddr,
+		keepaliveTime: time.Now(),
+		blockSize:     512,
+		timeout:       10,
+		fileHandler:   fileHandler,
+	}
+}
+
+func (p *clientPeer) Close() error {
+	if p.readSeekCloser != nil {
+		p.readSeekCloser.Close()
+	}
+	if p.writeSeekCloser != nil {
+		p.writeSeekCloser.Close()
+	}
+	return nil
+}
+
+func (p *clientPeer) Dispatch(conn net.PacketConn, data []byte) {
+	p.keepaliveTime = time.Now()
+
+	buff := bytes.NewBuffer(data)
+	var operation uint16
+	if err := binary.Read(buff, binary.BigEndian, &operation); err != nil {
+		// it's a invalid packet. just do nothing.
 		return
 	}
-	if p, ok := req.(packet); ok {
-		if p.getOpcode() == readFileReqOp {
-			err = peer.handleRRQ(p)
-		} else if p.getOpcode() == writeFileReqOp {
-			err = peer.handleWRQ(p)
-		}
-	}
-	if err != nil {
-		logln("err:", err.Error())
-	}
-	return
-}
 
-func (peer *clientPeer) applyBlockSizeOpt(req *rwPacket) (opt *oackOption, err error) {
-	if req.hasBlockSize {
-		peer.blockSize = defaultBlockSize
-		if req.blockSize < defaultBlockSize {
-			peer.blockSize = req.blockSize
-		}
-		var opt oackOption
-		opt.name = blockSizeOptName
-		opt.value = strconv.Itoa(int(peer.blockSize))
-		logf("process blocksize opt <blockSize=%dbyte>", peer.blockSize)
-		return &opt, nil
-	}
-	return
-}
-
-func (peer *clientPeer) applyTimeoutOpt(req *rwPacket) (opt *oackOption, err error) {
-	if req.hasTimeout {
-		peer.readTimeout, peer.writeTimeout = req.timeout, req.timeout
-		var opt oackOption
-		opt.name = timeoutOptName
-		opt.value = strconv.Itoa(int(req.timeout.Seconds()))
-		logf("process timeout opt <timeout=%s>", peer.readTimeout.String())
-		return &opt, nil
-	}
-	return
-}
-
-func (peer *clientPeer) applyTransferSizeOpt(req *rwPacket) (opt *oackOption, err error) {
-	if req.hasTransferSize {
-		var opt oackOption
-		opt.name = transferSizeOptName
-		if req.transferSize == 0 {
-			opt.value = strconv.Itoa(peer.fileSize)
-			logf("process tsize opt <orgTsize=0, newTsize=%d>", peer.fileSize)
-		} else {
-			if req.transferSize > maxTransferSize {
-				logf("process tsize opt <tisze=%d> is too big", req.transferSize)
-				return nil, errors.New("transferSize is too big")
+	switch operation {
+	case 1: // read request
+		p.HandleReadHandshake(conn, buff)
+	case 2: // write request
+		p.HandleWriteHandshake(conn, buff)
+	case 3: // data packet
+		p.HandleWriteData(conn, buff)
+	case 4: // ack packet
+		p.HandleReadAck(conn, buff)
+	case 5: // error packet
+		{
+			if err := handleError(buff); err != nil {
+				logln("err:", err)
 			}
-			peer.fileSize = req.transferSize
-			opt.value = strconv.Itoa(int(req.transferSize))
-			logf("process tsize opt <tsize=%d>", req.transferSize)
 		}
-		return &opt, nil
 	}
-	return
 }
 
-func (peer *clientPeer) applyOptions(req *rwPacket) (ackOpts []oackOption, err error) {
-	applier := []func(req *rwPacket) (opt *oackOption, err error){
-		peer.applyBlockSizeOpt,
-		peer.applyTimeoutOpt,
-		peer.applyTransferSizeOpt,
+func (p *clientPeer) HandleReadHandshake(conn net.PacketConn, buff *bytes.Buffer) {
+	var fileName string
+	var err error
+	if fileName, err = buff.ReadString(0); err != nil {
+		conn.WriteTo(errIllegalOperationPacket, p.remoteAddr)
+		return
 	}
-	for _, v := range applier {
-		var opt *oackOption
-		if opt, err = v(req); err != nil {
-			return nil, err
-		}
-		if opt != nil {
-			ackOpts = append(ackOpts, *opt)
-		}
-	}
-	return
-}
+	fileName = fileName[:len(fileName)-1]
 
-func (peer *clientPeer) handleRRQNegotiation(req *rwPacket) (err error) {
-	if req.hasOption {
-		logf("begin RRQ Negotiation")
-		defer func() {
-			if err == nil {
-				logf("end RRQ Negotiation success")
-			} else {
-				logf("end RRQ Negotiation failed. err=%s", err.Error())
-			}
-		}()
-
-		var opts []oackOption
-		if opts, err = peer.applyOptions(req); err != nil {
-			sendErrorReq(peer.conn, peer.addr, err.Error())
-			return err
-		}
-		oack := &oackPacket{}
-		oack.options = opts
-		if err = sendPacket(peer.conn, peer.addr, oack); err != nil {
-			logf("send OACK failed. err=%s", err.Error())
-			return err
-		}
-		logf("send OACK")
-
-		return processResponse(peer.conn, peer.readTimeout, peer.writeTimeout, nil,
-			func(resp interface{}) (goon bool, err error) {
-				if ack, ok := resp.(*ackPacket); ok {
-					if ack.blockID == 0 {
-						logf("recv ACK <blockID=0>")
-						return false, nil
-					}
-				}
-				return true, nil
-			})
-	}
-	return nil
-}
-
-func (peer *clientPeer) handleRRQ(p packet) error {
-	req := p.(*rwPacket)
-	logf("begin RRQ <fileName=%s, mode=%s, from=%s>", req.fileName, req.transferMode, peer.addr.String())
-	defer logf("end RRQ")
-
-	rc, err := peer.handler.ReadFile(req.fileName)
-	if err != nil {
-		logf("Open File Failed. err=%s", err.Error())
-		sendErrorReq(peer.conn, peer.addr, err.Error())
-		return err
-	}
-	defer rc.Close()
-	logf("Open File Success")
-
-	var fileSize int64
-	if fileSize, err = rc.Size(); err != nil {
-		sendErrorReq(peer.conn, peer.addr, err.Error())
-		return err
-	}
-	peer.fileSize = int(fileSize)
-
-	if err = peer.handleRRQNegotiation(req); err != nil {
-		return err
-	}
-
-	buff := make([]byte, peer.blockSize)
-	var blockID uint16 = 1
-	for {
-		n, err := rc.Read(buff)
+	if exist, err := p.fileHandler.IsFileExist(p.remoteAddr.String(), fileName); err != nil || !exist {
 		if err != nil {
-			if err != io.EOF {
-				logf("readFile failed. err=%s", err.Error())
-				sendErrorReq(peer.conn, peer.addr, err.Error())
-				return err
-			}
+			sendError(conn, p.remoteAddr, err)
+			return
 		}
+		conn.WriteTo(errFileNotFoundPacket, p.remoteAddr)
+		return
+	}
 
-		dq := &dataPacket{}
-		dq.blockID = blockID
-		dq.data = buff[0:n]
-		if err = sendPacket(peer.conn, peer.addr, dq); err != nil {
-			logf("send DQ failed. err=%s <blockID=%d, %dbytes>", err.Error(), blockID, len(dq.data))
-			return err
+	if p.readSeekCloser == nil {
+		if p.readSeekCloser, err = p.fileHandler.ReadFile(p.remoteAddr.String(), fileName); err != nil {
+			sendError(conn, p.remoteAddr, err)
+			return
 		}
-		logf("send DQ  <blockID=%d, %dbytes>", blockID, len(dq.data))
+	}
 
-		err = processResponse(peer.conn, peer.readTimeout, peer.writeTimeout, nil,
-			func(resp interface{}) (goon bool, err error) {
-				if ack, ok := resp.(*ackPacket); ok {
-					if ack.blockID == blockID {
-						return false, nil
-					}
-				}
-				return true, nil
-			})
-		if err != nil {
-			logf("recv ACK failed. err=%s <blockID=%d>", err.Error(), blockID)
-			return err
-		}
-		logf("recv ACK <blockID=%d>", blockID)
-		if n < int(peer.blockSize) {
-			logf("finalACK")
+	var mode string
+	if mode, err = buff.ReadString(0); err != nil {
+		conn.WriteTo(errIllegalOperationPacket, p.remoteAddr)
+		return
+	}
+	mode = strings.ToLower(mode[:len(mode)-1])
+	if mode != "octet" {
+		conn.WriteTo(errIllegalOperationPacket, p.remoteAddr)
+		return
+	}
+
+	hasOption := false
+	if buff.Len() > 0 {
+		hasOption = true
+	}
+	for buff.Len() > 0 {
+		var optionName string
+		if optionName, err = buff.ReadString(0); err != nil {
 			break
 		}
-		blockID++
+		optionName = strings.ToLower(optionName[:len(optionName)-1])
+		var value string
+		if value, err = buff.ReadString(0); err != nil {
+			break
+		}
+		value = value[:len(value)-1]
+		switch optionName {
+		case "blksize":
+			{
+				var size int
+				if size, err = strconv.Atoi(value); err != nil {
+					break
+				}
+				// RFC2348 define the minimum size is 8byte
+				if size < 8 {
+					err = fmt.Errorf("the value of blksize is too small")
+					break
+				}
+
+				if size < p.blockSize {
+					p.blockSize = size
+				}
+			}
+		case "timeout":
+			{
+				var timeout int
+				if timeout, err = strconv.Atoi(value); err != nil {
+					break
+				}
+				// RFC2349 define the minimum timeout is 1second.
+				if timeout < 1 {
+					err = fmt.Errorf("the value of timeout is invalid")
+					break
+				}
+				if timeout < p.timeout {
+					p.timeout = timeout
+				}
+			}
+		case "tsize":
+			{
+				tsize, err := p.readSeekCloser.Seek(0, 2)
+				if err != nil {
+					break
+				}
+				p.transferSize = int(tsize)
+			}
+		default:
+			{
+				err = fmt.Errorf("unknown option")
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
 	}
 
-	return nil
-}
+	if err != nil {
+		sendError(conn, p.remoteAddr, err)
+		return
+	}
 
-func (peer *clientPeer) handleWRQNegotiation(p packet) (err error) {
-	req := p.(*rwPacket)
-	if req.hasOption {
-		logf("begin WRQ Negotiation")
-		defer func() {
-			if err == nil {
-				logf("end WRQ Negotiation success")
-			} else {
-				logf("end WRQ Negotiation failed. err=%s", err.Error())
-			}
-		}()
-
-		var opts []oackOption
-		if opts, err = peer.applyOptions(req); err != nil {
-			sendErrorReq(peer.conn, peer.addr, err.Error())
-			return err
-		}
-		oack := &oackPacket{}
-		oack.options = opts
-		if err = sendPacket(peer.conn, peer.addr, oack); err != nil {
-			logf("send OACK failed.err=%s", err.Error())
-			return err
-		}
-		logf("send OACK")
+	if hasOption {
+		sendOptionAck(conn, p.remoteAddr, p.blockSize, p.timeout, p.transferSize)
 	} else {
-		ack := &ackPacket{}
-		ack.blockID = 0
-		if err = sendPacket(peer.conn, peer.addr, ack); err != nil {
-			logf("send ACK failed, err=%s, <blockID=0>", err.Error())
-			return err
+		datapacket := make([]byte, 4+p.blockSize)
+		n, err := p.readSeekCloser.Read(datapacket[4:])
+		if err != nil {
+			sendError(conn, p.remoteAddr, err)
+		} else {
+			binary.BigEndian.PutUint16(datapacket, 0x03)
+			binary.BigEndian.PutUint16(datapacket[2:], 0x01)
+			conn.WriteTo(datapacket[:n+4], p.remoteAddr)
+			logln("send datapacket, blockid: 1")
 		}
-		logf("send ACK <blockID=0>")
 	}
-	return nil
+	return
 }
 
-func (peer *clientPeer) handleWRQ(p packet) error {
-	req := p.(*rwPacket)
-	logf("begin WRQ <fileName=%s, mode=%s, from=%s>", req.fileName, req.transferMode, peer.addr.String())
-	defer logf("end WRQ")
+func (p *clientPeer) HandleReadAck(conn net.PacketConn, buff *bytes.Buffer) {
+	if p.readSeekCloser == nil {
+		conn.WriteTo(errIllegalOperationPacket, p.remoteAddr)
+		return
+	}
 
-	wc, err := peer.handler.WriteFile(req.fileName)
+	var blockID uint16
+	if err := binary.Read(buff, binary.BigEndian, &blockID); err != nil {
+		logln("HandleReadAck parse block failed, err:", err)
+		return
+	}
+	logln("get ack, blockid:", blockID)
+
+	fileSize, err := p.readSeekCloser.Seek(0, 2)
 	if err != nil {
-		logf("Open File Failed. err=%s", err.Error())
-		sendErrorReq(peer.conn, peer.addr, err.Error())
-		return err
-	}
-	defer wc.Close()
-	logf("Open File success")
-
-	if err = peer.handleWRQNegotiation(req); err != nil {
-		return err
+		sendError(conn, p.remoteAddr, err)
+		return
 	}
 
-	var blockID uint16 = 1
-	var finalACK bool
-	var transferSize int
-	if peer.fileSize == 0 {
-		peer.fileSize = maxTransferSize
+	if fileSize < int64(blockID)*int64(p.blockSize) {
+		return
 	}
-	for transferSize < peer.fileSize {
-		err = processResponse(peer.conn, peer.readTimeout, peer.writeTimeout, nil,
-			func(resp interface{}) (goon bool, err error) {
-				if dq, ok := resp.(*dataPacket); ok {
-					if dq.blockID != blockID {
-						return true, nil
-					}
-					logf("recv DQ  <blockID=%d, %dbytes>", blockID, len(dq.data))
-					if _, err := wc.Write(dq.data); err != nil {
-						logf("write failed. err=%s", err.Error())
-						sendErrorReq(peer.conn, peer.addr, err.Error())
-						return false, err
-					}
-					if len(dq.data) < int(peer.blockSize) {
-						finalACK = true
-					}
-					transferSize += len(dq.data)
-					return false, nil
-				}
-				return true, nil
-			})
+
+	datapacket := make([]byte, 4+p.blockSize)
+	binary.BigEndian.PutUint16(datapacket, 0x03)
+	binary.BigEndian.PutUint16(datapacket[2:], blockID+1)
+	if _, err := p.readSeekCloser.Seek(int64(blockID)*int64(p.blockSize), 0); err != nil {
+		sendError(conn, p.remoteAddr, err)
+		return
+	}
+	n, err := p.readSeekCloser.Read(datapacket[4:])
+	if err != nil && err != io.EOF {
+		sendError(conn, p.remoteAddr, err)
+		return
+	}
+
+	_, err = conn.WriteTo(datapacket[:4+n], p.remoteAddr)
+	if err != nil {
+		logln("DQ err:", err)
+	}
+	if n < p.blockSize {
+		logln("Final DQ, n:", n)
+	}
+	return
+}
+
+func (p *clientPeer) HandleWriteHandshake(conn net.PacketConn, buff *bytes.Buffer) {
+	var fileName string
+	var err error
+	if fileName, err = buff.ReadString(0); err != nil {
+		conn.WriteTo(errIllegalOperationPacket, p.remoteAddr)
+		return
+	}
+	fileName = fileName[:len(fileName)-1]
+
+	if exist, err := p.fileHandler.IsFileExist(p.remoteAddr.String(), fileName); err != nil || exist {
 		if err != nil {
-			logf("recv DQ failed. err=%s <blockID=%d>", err.Error(), blockID)
-			return err
+			sendError(conn, p.remoteAddr, err)
+			return
 		}
-
-		ack := &ackPacket{}
-		ack.blockID = blockID
-		if err = sendPacket(peer.conn, peer.addr, ack); err != nil {
-			logf("send ACK failed. err=%s <blockID=%d>", err.Error(), blockID)
-			return err
+		conn.WriteTo(errFileExistPacket, p.remoteAddr)
+		return
+	}
+	if p.writeSeekCloser == nil {
+		if p.writeSeekCloser, err = p.fileHandler.WriteFile(p.remoteAddr.String(), fileName); err != nil {
+			sendError(conn, p.remoteAddr, err)
+			return
 		}
-		logf("send ACK <blockID=%d>", blockID)
+	}
 
-		if finalACK {
-			logf("finalACK")
-			processResponse(peer.conn, peer.readTimeout, peer.writeTimeout, nil,
-				func(resp interface{}) (goon bool, err error) {
-					// if recv dq, means final ack was lost,
-					// so if blockID matched, then resend final ack
-					if dq, ok := resp.(*dataPacket); ok {
-						if dq.blockID == blockID {
-							sendPacket(peer.conn, peer.addr, ack)
-						}
-					}
-					return false, nil
-				})
+	var mode string
+	if mode, err = buff.ReadString(0); err != nil {
+		conn.WriteTo(errIllegalOperationPacket, p.remoteAddr)
+		return
+	}
+	mode = strings.ToLower(mode[:len(mode)-1])
+	if mode != "octet" {
+		conn.WriteTo(errIllegalOperationPacket, p.remoteAddr)
+		return
+	}
+
+	hasOption := false
+	if buff.Len() > 0 {
+		hasOption = true
+	}
+
+	for buff.Len() > 0 {
+		var optionName string
+		if optionName, err = buff.ReadString(0); err != nil {
 			break
 		}
-		blockID++
+		optionName = strings.ToLower(optionName[:len(optionName)-1])
+		var value string
+		if value, err = buff.ReadString(0); err != nil {
+			break
+		}
+		value = value[:len(value)-1]
+		switch optionName {
+		case "blksize":
+			{
+				var size int
+				if size, err = strconv.Atoi(value); err != nil {
+					break
+				}
+				// RFC2348 define the minimum size is 8byte
+				if size < 8 {
+					err = fmt.Errorf("the value of blksize is too small")
+					break
+				}
+
+				if size < p.blockSize {
+					p.blockSize = size
+				}
+			}
+		case "timeout":
+			{
+				var timeout int
+				if timeout, err = strconv.Atoi(value); err != nil {
+					break
+				}
+				// RFC2349 define the minimum timeout is 1second.
+				if timeout < 1 {
+					err = fmt.Errorf("the value of timeout is invalid")
+					break
+				}
+				if timeout < p.timeout {
+					p.timeout = timeout
+				}
+			}
+		case "tsize":
+			{
+				var tsize int
+				if tsize, err = strconv.Atoi(value); err != nil {
+					break
+				}
+				p.transferSize = tsize
+			}
+		default:
+			{
+				err = fmt.Errorf("unknown option: %s", optionName)
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
 	}
-	return nil
+
+	if err != nil {
+		sendError(conn, p.remoteAddr, err)
+		return
+	}
+
+	if hasOption {
+		sendOptionAck(conn, p.remoteAddr, p.blockSize, p.timeout, p.transferSize)
+	} else {
+		ackpacket := []byte{0x00, 0x04, 0x00, 0x00}
+		conn.WriteTo(ackpacket, p.remoteAddr)
+	}
+	return
+}
+
+func (p *clientPeer) HandleWriteData(conn net.PacketConn, buff *bytes.Buffer) {
+	if p.writeSeekCloser == nil {
+		conn.WriteTo(errIllegalOperationPacket, p.remoteAddr)
+		return
+	}
+
+	var blockID uint16
+	if err := binary.Read(buff, binary.BigEndian, &blockID); err != nil {
+		return
+	}
+	if blockID == 0 {
+		conn.WriteTo(errIllegalOperationPacket, p.remoteAddr)
+		return
+	}
+	logln("GET DQ, blockid:", blockID)
+
+	data := buff.Next(buff.Len())
+	if _, err := p.writeSeekCloser.Seek(int64(blockID-1)*int64(p.blockSize), 0); err != nil {
+		sendError(conn, p.remoteAddr, err)
+		return
+	}
+	if _, err := p.writeSeekCloser.Write(data); err != nil {
+		logln("err:", err)
+		sendError(conn, p.remoteAddr, err)
+		return
+	}
+
+	ackpacket := []byte{0x00, 0x04, 0x00, 0x00}
+	binary.BigEndian.PutUint16(ackpacket[2:], blockID)
+	_, err := conn.WriteTo(ackpacket, p.remoteAddr)
+	if err != nil {
+		logln("DQ, err:", err)
+	}
+	logln("ACK blockid:", blockID)
+	if len(data) < p.blockSize {
+		logln("Final DQ")
+	}
 }
