@@ -3,9 +3,10 @@ package main
 import (
 	"flag"
 	"fmt"
-	"gotftp"
 	"os"
 	"time"
+
+	"github.com/eahydra/gotftp"
 )
 
 func main() {

@@ -2,9 +2,10 @@ package main
 
 import (
 	"fmt"
-	"gotftp"
 	"os"
 	"time"
+
+	"github.com/eahydra/gotftp"
 )
 
 type FileHandler struct{}
@@ -30,8 +31,7 @@ func (s *FileHandler) IsFileExist(remoteAddr, fileName string) (exist bool, err 
 }
 
 func main() {
-	if s, err := gotftp.NewServer(":69", &FileHandler{},
-		time.Duration(2)*time.Second, time.Duration(3)*time.Second); err == nil {
+	if s, err := gotftp.NewServer(":69", &FileHandler{}, time.Duration(3)*time.Second); err == nil {
 		defer s.Close()
 		if err = s.Run(); err != nil {
 			fmt.Println("err:", err)
